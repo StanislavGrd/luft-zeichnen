@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Luft-Ninja</title>
+<style>
+  :root { --bg:#0b0d10; --fg:#f3f4f6; --accent:#ff7a1a; --muted:#9aa3ad; }
+  * { box-sizing:border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--fg);
+    font: 15px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  .stage { height:100%; display:grid; place-items:center; padding:12px; }
+  .wrap { position:relative; height:100%; max-width:100%; aspect-ratio:4/3; border-radius:14px; overflow:hidden; background:#000; }
+  video, canvas { position:absolute; inset:0; width:100%; height:100%; }
+  video { object-fit:cover; transform:scaleX(-1); filter:saturate(.7) brightness(.55); }
+  .screen { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:14px; text-align:center; background:rgba(0,0,0,.55); z-index:5; padding:16px; }
+  .screen h1 { font-size:clamp(34px,6vw,64px); margin:0; letter-spacing:.02em; text-shadow:0 4px 30px rgba(255,122,26,.6); }
+  .screen p { margin:0; color:var(--muted); max-width:46ch; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:10px; padding:14px 26px; font:inherit; font-size:18px; font-weight:600; cursor:pointer; }
+  button:focus-visible { outline:3px solid #fff; outline-offset:3px; }
+  [hidden] { display:none !important; }
+</style>
+</head>
+<body>
+<div class="stage">
+  <div class="wrap">
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="game"></canvas>
+    <div class="screen" id="startScreen">
+      <h1>🍉 Luft-Ninja</h1>
+      <p>Schneide die Früchte mit deinem Zeigefinger durch. Schnelle Bewegung = Schnitt. Finger weg von den 💣 Bomben! Lässt du 3 Früchte fallen, ist das Spiel vorbei.</p>
+      <button id="start">Kamera starten</button>
+    </div>
+  </div>
+</div>
+
+<script type="module">
+import { HandLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+const video = document.getElementById("video");
+const cv = document.getElementById("game"), ctx = cv.getContext("2d");
+const FRUITS = [
+  { e: "🍉", c: "#ff3b5c" }, { e: "🍎", c: "#ff4040" }, { e: "🍊", c: "#ff9f1a" }, { e: "🍋", c: "#ffe14d" },
+  { e: "🍍", c: "#ffd23f" }, { e: "🥝", c: "#7ed957" }, { e: "🍓", c: "#ff2d55" }, { e: "🍑", c: "#ffad7a" },
+];
+const GOLD = { e: "⭐", c: "#ffd60a", gold: true };
+
+let landmarker, lastVideoTime = -1, W = 1280, H = 960;
+let objs = [], halves = [], parts = [], texts = [], trail = [];
+let score = 0, lives = 3, best = 0, phase = "idle", spawnT = 0, gameT = 0, shake = 0;
+let tip = null, prevTip = null, hoverBtn = 0;
+try { best = +localStorage.getItem("luftninja-best") || 0; } catch {}
+
+// ---------- Kamera ----------
+document.getElementById("start").onclick = async (e) => {
+  const b = e.currentTarget; b.disabled = true; b.textContent = "Lade Hand-Erkennung…";
+  try {
+    video.srcObject = await navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 960 } });
+    await new Promise(r => video.onloadedmetadata = r);
+    W = cv.width = video.videoWidth; H = cv.height = video.videoHeight;
+    const files = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+    landmarker = await HandLandmarker.createFromOptions(files, {
+      baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task", delegate: "GPU" },
+      runningMode: "VIDEO", numHands: 1,
+    });
+    document.getElementById("startScreen").hidden = true;
+    newGame();
+    requestAnimationFrame(loop);
+  } catch (err) {
+    b.disabled = false;
+    b.textContent = "Fehler: " + (err.name === "NotAllowedError" ? "Kamera nicht erlaubt" : err.message);
+  }
+};
+
+function newGame() {
+  objs = []; halves = []; texts = []; score = 0; lives = 3; gameT = 0; spawnT = 0; phase = "play";
+  floatText(W / 2, H / 2, "Los! 🔪", "#fff", 90);
+}
+
+// ---------- Objekte ----------
+function spawn() {
+  const level = Math.min(1, gameT / 60000);           // wird über 60 s schwerer
+  const n = 1 + Math.floor(Math.random() * (1 + level * 3));
+  for (let k = 0; k < n; k++) {
+    const r = Math.random();
+    const bombChance = 0.12 + level * 0.12;
+    const kind = r < bombChance ? { e: "💣", c: "#888", bomb: true } : r > 0.97 ? GOLD : FRUITS[Math.floor(Math.random() * FRUITS.length)];
+    const x = W * (0.2 + Math.random() * 0.6);
+    objs.push({
+      ...kind, x, y: H + 60,
+      vx: (W / 2 - x) * (0.004 + Math.random() * 0.006) + (Math.random() - .5) * 3,
+      vy: -(H * 0.028 + Math.random() * H * 0.008),
+      rot: 0, vr: (Math.random() - .5) * 0.15, r: H * 0.07, sliced: false,
+    });
+  }
+}
+
+function segCircle(a, b, c, r) {
+  const dx = b.x - a.x, dy = b.y - a.y, l2 = dx * dx + dy * dy || 1;
+  let t = ((c.x - a.x) * dx + (c.y - a.y) * dy) / l2; t = Math.max(0, Math.min(1, t));
+  return Math.hypot(a.x + t * dx - c.x, a.y + t * dy - c.y) < r;
+}
+
+function slice(o, dir) {
+  o.sliced = true;
+  if (o.bomb) { explode(o); return; }
+  const pts = o.gold ? 5 : 1;
+  score += pts;
+  const ang = Math.atan2(dir.y, dir.x);
+  for (const s of [-1, 1]) {
+    halves.push({ e: o.e, x: o.x, y: o.y, vx: o.vx + Math.cos(ang + s * Math.PI / 2) * 5, vy: o.vy * 0.4 + Math.sin(ang + s * Math.PI / 2) * 5 - 2,
+      rot: o.rot, vr: s * 0.12, r: o.r, cut: ang, side: s, life: 1 });
+  }
+  burst(o.x, o.y, o.c, 26, 9);
+  if (o.gold) floatText(o.x, o.y - 40, "+5 ⭐", "#ffd60a", 60);
+}
+
+function explode(o) {
+  burst(o.x, o.y, "#ffb020", 80, 16); burst(o.x, o.y, "#ff3b30", 50, 12);
+  shake = 30; lives = 0;
+  floatText(o.x, o.y, "💥 BOOM", "#ff3b30", 110);
+  setTimeout(gameOver, 900);
+}
+
+function gameOver() {
+  if (phase !== "play") return;
+  phase = "over";
+  if (score > best) { best = score; try { localStorage.setItem("luftninja-best", best); } catch {} }
+}
+
+function burst(x, y, color, n, speed) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * 6.283, s = Math.random() * speed;
+    parts.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s - 2, life: 1, color, size: 3 + Math.random() * 6 });
+  }
+}
+function floatText(x, y, txt, color, size) { texts.push({ x, y, txt, color, size, life: 1 }); }
+
+// ---------- Hauptschleife ----------
+let lastNow = performance.now();
+function loop(now) {
+  const dt = Math.min(50, now - lastNow); lastNow = now;
+  const f = dt / 16.67;
+
+  // Hand
+  if (video.currentTime !== lastVideoTime) {
+    lastVideoTime = video.currentTime;
+    const res = landmarker.detectForVideo(video, now);
+    if (res.landmarks?.length) {
+      const p = res.landmarks[0][8];
+      const np = { x: (1 - p.x) * W, y: p.y * H };
+      tip = tip ? { x: tip.x * 0.3 + np.x * 0.7, y: tip.y * 0.3 + np.y * 0.7 } : np;
+    } else tip = null;
+  }
+
+  const speed = tip && prevTip ? Math.hypot(tip.x - prevTip.x, tip.y - prevTip.y) : 0;
+  if (tip) trail.push({ x: tip.x, y: tip.y, t: now });
+  trail = trail.filter(p => now - p.t < 160);
+
+  // Schneiden
+  if (phase === "play" && tip && prevTip && speed > 14) {
+    const dir = { x: tip.x - prevTip.x, y: tip.y - prevTip.y };
+    let combo = 0;
+    for (const o of objs) if (!o.sliced && segCircle(prevTip, tip, o, o.r)) { slice(o, dir); if (!o.bomb) combo++; }
+    if (combo >= 3) { score += combo; floatText(tip.x, tip.y - 60, `${combo}er Combo! +${combo}`, "#7ef0ff", 64); }
+  }
+  prevTip = tip;
+
+  // Spawnen
+  if (phase === "play") {
+    gameT += dt; spawnT -= dt;
+    if (spawnT <= 0) { spawn(); spawnT = Math.max(650, 1600 - gameT / 60); }
+  }
+
+  // Physik
+  const g = H * 0.00055 * f;
+  for (const o of objs) { o.vy += g; o.x += o.vx * f; o.y += o.vy * f; o.rot += o.vr * f; }
+  for (const o of objs) {
+    if (!o.sliced && o.y > H + 80 && o.vy > 0) {
+      o.sliced = true;
+      if (!o.bomb && !o.gold && phase === "play") { lives--; floatText(Math.max(80, Math.min(W - 80, o.x)), H - 60, "❌", "#ff3b30", 60); if (lives <= 0) gameOver(); }
+    }
+  }
+  objs = objs.filter(o => !o.sliced);
+  for (const h of halves) { h.vy += g; h.x += h.vx * f; h.y += h.vy * f; h.rot += h.vr * f; h.life -= 0.01 * f; }
+  halves = halves.filter(h => h.y < H + 150 && h.life > 0);
+  for (const p of parts) { p.vy += g * 0.6; p.x += p.vx * f; p.y += p.vy * f; p.life -= 0.022 * f; }
+  parts = parts.filter(p => p.life > 0);
+  for (const t of texts) { t.y -= 1.2 * f; t.life -= 0.015 * f; }
+  texts = texts.filter(t => t.life > 0);
+
+  render(now, speed);
+  requestAnimationFrame(loop);
+}
+
+// ---------- Zeichnen ----------
+function emoji(e, x, y, r, rot) {
+  ctx.save(); ctx.translate(x, y); ctx.rotate(rot);
+  ctx.font = `${r * 2}px "Apple Color Emoji","Segoe UI Emoji",sans-serif`;
+  ctx.textAlign = "center"; ctx.textBaseline = "middle"; ctx.fillText(e, 0, r * 0.08);
+  ctx.restore();
+}
+
+function render(now, speed) {
+  ctx.save();
+  ctx.clearRect(0, 0, W, H);
+  if (shake > 0) { ctx.translate((Math.random() - .5) * shake, (Math.random() - .5) * shake); shake *= 0.9; if (shake < .5) shake = 0; }
+
+  // Saft
+  for (const p of parts) { ctx.globalAlpha = p.life; ctx.fillStyle = p.color; ctx.beginPath(); ctx.arc(p.x, p.y, p.size * p.life, 0, 6.283); ctx.fill(); }
+  ctx.globalAlpha = 1;
+
+  // Früchte
+  for (const o of objs) {
+    if (o.bomb) { ctx.save(); ctx.shadowBlur = 25 + Math.sin(now / 80) * 10; ctx.shadowColor = "#ff3b30"; emoji(o.e, o.x, o.y, o.r, o.rot); ctx.restore(); }
+    else if (o.gold) { ctx.save(); ctx.shadowBlur = 30; ctx.shadowColor = "#ffd60a"; emoji(o.e, o.x, o.y, o.r, o.rot); ctx.restore(); }
+    else emoji(o.e, o.x, o.y, o.r, o.rot);
+  }
+  // Hälften (an der Schnittlinie abgeschnitten)
+  for (const h of halves) {
+    ctx.save(); ctx.globalAlpha = Math.min(1, h.life * 2);
+    ctx.translate(h.x, h.y); ctx.rotate(h.cut);
+    ctx.beginPath(); ctx.rect(-h.r * 1.5, h.side < 0 ? -h.r * 1.5 : 0, h.r * 3, h.r * 1.5); ctx.clip();
+    ctx.rotate(-h.cut); emoji(h.e, 0, 0, h.r, h.rot);
+    ctx.restore();
+  }
+
+  // Klinge
+  if (trail.length > 1) {
+    for (let i = 1; i < trail.length; i++) {
+      const a = trail[i - 1], b = trail[i], k = i / trail.length;
+      ctx.strokeStyle = `rgba(200,240,255,${k})`; ctx.lineWidth = 3 + k * 14; ctx.lineCap = "round";
+      ctx.shadowBlur = 20; ctx.shadowColor = "#7ef0ff";
+      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+    }
+    ctx.shadowBlur = 0;
+  }
+  if (tip) { ctx.fillStyle = speed > 14 ? "#7ef0ff" : "#fff"; ctx.beginPath(); ctx.arc(tip.x, tip.y, 9, 0, 6.283); ctx.fill(); }
+
+  // Texte
+  for (const t of texts) {
+    ctx.globalAlpha = Math.min(1, t.life * 2); ctx.fillStyle = t.color;
+    ctx.font = `800 ${t.size}px -apple-system, sans-serif`; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.lineWidth = 6; ctx.strokeStyle = "rgba(0,0,0,.6)"; ctx.strokeText(t.txt, t.x, t.y); ctx.fillText(t.txt, t.x, t.y);
+  }
+  ctx.globalAlpha = 1;
+
+  // HUD
+  ctx.textBaseline = "top"; ctx.textAlign = "left";
+  ctx.font = "800 64px -apple-system, sans-serif"; ctx.fillStyle = "#ffd60a";
+  ctx.lineWidth = 6; ctx.strokeStyle = "rgba(0,0,0,.6)"; ctx.strokeText(score, 28, 20); ctx.fillText(score, 28, 20);
+  ctx.font = "600 26px -apple-system, sans-serif"; ctx.fillStyle = "#fff"; ctx.fillText("Rekord: " + best, 30, 92);
+  ctx.textAlign = "right"; ctx.font = "48px sans-serif";
+  ctx.fillText("❤️".repeat(Math.max(0, lives)) + "🖤".repeat(3 - Math.max(0, lives)), W - 24, 24);
+
+  if (phase === "over") drawGameOver(now);
+  ctx.restore();
+}
+
+// Game Over: Finger 1 s auf "Nochmal" halten (oder Leertaste)
+function drawGameOver(now) {
+  ctx.fillStyle = "rgba(0,0,0,.6)"; ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.font = "900 110px -apple-system, sans-serif"; ctx.fillStyle = "#ff7a1a"; ctx.fillText("Game Over", W / 2, H * 0.3);
+  ctx.font = "700 48px -apple-system, sans-serif"; ctx.fillStyle = "#fff";
+  ctx.fillText(`${score} Punkte` + (score >= best && score > 0 ? "  🏆 Neuer Rekord!" : ""), W / 2, H * 0.43);
+  const bx = W / 2, by = H * 0.65, br = 95;
+  const over = tip && Math.hypot(tip.x - bx, tip.y - by) < br;
+  hoverBtn = over ? (hoverBtn || now) : 0;
+  const prog = over ? Math.min(1, (now - hoverBtn) / 1000) : 0;
+  ctx.beginPath(); ctx.arc(bx, by, br, 0, 6.283); ctx.fillStyle = over ? "#ff9640" : "#ff7a1a"; ctx.fill();
+  ctx.beginPath(); ctx.arc(bx, by, br + 14, -Math.PI / 2, -Math.PI / 2 + prog * 6.283); ctx.lineWidth = 10; ctx.strokeStyle = "#ffd60a"; ctx.stroke();
+  ctx.font = "800 40px -apple-system, sans-serif"; ctx.fillStyle = "#fff"; ctx.fillText("Nochmal", bx, by);
+  ctx.font = "500 24px -apple-system, sans-serif"; ctx.fillStyle = "#ccc"; ctx.fillText("Finger auf den Kreis halten · oder Leertaste", bx, by + br + 50);
+  if (prog >= 1) { hoverBtn = 0; newGame(); }
+}
+
+document.addEventListener("keydown", (e) => { if (e.code === "Space" && phase === "over") { e.preventDefault(); newGame(); } });
+</script>
+</body>
+</html>

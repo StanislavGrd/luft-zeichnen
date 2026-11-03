@@ -1,0 +1,329 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Luft-Zeichnen</title>
+<style>
+  :root { --bg:#0e1014; --panel:#181b21; --fg:#eef0f3; --muted:#8f99a6; --accent:#ff4d6d; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--fg);
+    font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  .app { display:flex; flex-direction:column; height:100%; }
+  .bar { display:flex; flex-wrap:wrap; gap:8px; align-items:center; padding:10px 16px; background:var(--panel); }
+  .bar h1 { font-size:16px; margin:0 10px 0 0; }
+  button { background:#2a2f37; color:var(--fg); border:0; border-radius:6px; padding:7px 11px; cursor:pointer; font:inherit; }
+  button.on { background:var(--accent); }
+  button:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+  label { color:var(--muted); display:flex; align-items:center; gap:6px; }
+  .status { margin-left:auto; color:var(--muted); font-variant-numeric:tabular-nums; }
+  .stage { flex:1; display:grid; place-items:center; overflow:hidden; padding:12px; min-height:0; }
+  .wrap { position:relative; max-width:100%; max-height:100%; aspect-ratio:4/3; height:100%; border-radius:12px; overflow:hidden; background:#000; }
+  video, canvas { position:absolute; inset:0; width:100%; height:100%; }
+  video { object-fit:cover; transform:scaleX(-1); transition:opacity .4s; }
+  video.dim { opacity:0; }
+  #start { position:absolute; inset:0; margin:auto; width:max-content; height:max-content; padding:14px 22px; font-size:16px; background:var(--accent); z-index:5; }
+  .help { color:var(--muted); padding:8px 16px 14px; font-size:13px; }
+  .help b { color:var(--fg); font-weight:600; }
+  .toast { position:absolute; left:50%; bottom:18px; transform:translateX(-50%); background:rgba(0,0,0,.7); padding:8px 14px; border-radius:20px; font-size:15px; opacity:0; transition:opacity .3s; pointer-events:none; z-index:6; }
+  .toast.show { opacity:1; }
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="bar">
+    <h1>✍️ Luft-Zeichnen</h1>
+    <button id="undo" title="Rückgängig (Z)">↶ Rückgängig</button>
+    <button id="clear" title="Löschen (C)">Löschen</button>
+    <button id="bgBtn" title="Hintergrund (B)">Tafel-Modus</button>
+    <label for="size">Dicke <input id="size" type="range" min="2" max="40" value="10"></label>
+    <button id="save" title="Speichern (S)">Speichern</button>
+    <span class="status" id="status">Kamera aus</span>
+  </div>
+  <div class="stage">
+    <div class="wrap">
+      <video id="video" autoplay playsinline muted></video>
+      <canvas id="draw"></canvas>
+      <canvas id="fx"></canvas>
+      <canvas id="ui"></canvas>
+      <button id="start">Kamera starten</button>
+      <div class="toast" id="toast"></div>
+    </div>
+  </div>
+  <div class="help">
+    <b>☝️ Zeigefinger</b> = zeichnen · <b>✌️ Zwei Finger</b> = Stift hoch · <b>Mit dem Finger kurz über ein Symbol oben halten</b> = auswählen ·
+    <b>✊ Faust halten</b> = alles löschen · <b>🖐️ Ganze Hand</b> = Radieren · Tasten: 1–5 Farbe, Q/W/E/R/T Pinsel, K Kaleidoskop, Z rückgängig
+  </div>
+</div>
+
+<script type="module">
+import { HandLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+const $ = (id) => document.getElementById(id);
+const video = $("video");
+const draw = $("draw"), dctx = draw.getContext("2d");
+const fx = $("fx"), fctx = fx.getContext("2d");
+const ui = $("ui"), uctx = ui.getContext("2d");
+
+const COLORS = ["#ff3b5c", "#2ef08a", "#3ba2ff", "#ffd60a", "#ffffff"];
+const BRUSHES = [
+  { id: "normal", label: "✏️", name: "Stift" },
+  { id: "neon", label: "💡", name: "Neon" },
+  { id: "rainbow", label: "🌈", name: "Regenbogen" },
+  { id: "sparkle", label: "✨", name: "Funken" },
+  { id: "spray", label: "💨", name: "Spray" },
+];
+const state = { color: COLORS[0], brush: "neon", kaleido: false, size: 10, hue: 0, board: false };
+
+let landmarker, prev = null, smooth = null, lastTime = -1;
+let particles = [], undoStack = [], strokeActive = false;
+let hover = { key: null, t: 0 }, fistStart = 0, frames = 0, fpsT = performance.now(), fps = 0;
+
+// ---------- Luft-Menü (oben im Bild) ----------
+function menuItems() {
+  const W = ui.width, items = [];
+  const n = COLORS.length + BRUSHES.length + 2;
+  const r = Math.min(34, W / (n * 2.6));
+  const gap = r * 2.5, start = W / 2 - (gap * (n - 1)) / 2, y = r + 18;
+  let i = 0;
+  COLORS.forEach((c, k) => items.push({ key: "c" + k, x: start + gap * i++, y, r, color: c, active: state.color === c && state.brush !== "rainbow" }));
+  BRUSHES.forEach((b) => items.push({ key: "b" + b.id, x: start + gap * i++, y, r, label: b.label, active: state.brush === b.id }));
+  items.push({ key: "kaleido", x: start + gap * i++, y, r, label: "❄️", active: state.kaleido });
+  items.push({ key: "undo", x: start + gap * i++, y, r, label: "↶", active: false });
+  return items;
+}
+function choose(key) {
+  if (key.startsWith("c")) { state.color = COLORS[+key.slice(1)]; if (state.brush === "rainbow") state.brush = "neon"; toast("Farbe gewechselt"); }
+  else if (key.startsWith("b")) { state.brush = key.slice(1); toast(BRUSHES.find(b => b.id === state.brush).name); }
+  else if (key === "kaleido") { state.kaleido = !state.kaleido; toast(state.kaleido ? "Kaleidoskop an ❄️" : "Kaleidoskop aus"); }
+  else if (key === "undo") undo();
+  burst(ui.width / 2, 60, state.color, 25);
+}
+function drawMenu(fingerPos, now) {
+  for (const it of menuItems()) {
+    uctx.save();
+    uctx.beginPath(); uctx.arc(it.x, it.y, it.r, 0, Math.PI * 2);
+    uctx.fillStyle = it.color || "rgba(20,22,28,.75)"; uctx.fill();
+    uctx.lineWidth = it.active ? 5 : 2; uctx.strokeStyle = it.active ? "#fff" : "rgba(255,255,255,.35)"; uctx.stroke();
+    if (it.label) { uctx.font = `${it.r}px sans-serif`; uctx.textAlign = "center"; uctx.textBaseline = "middle"; uctx.fillStyle = "#fff"; uctx.fillText(it.label, it.x, it.y + 2); }
+    if (fingerPos && hover.key === it.key) {
+      const p = Math.min(1, (now - hover.t) / 600);
+      uctx.beginPath(); uctx.arc(it.x, it.y, it.r + 8, -Math.PI / 2, -Math.PI / 2 + p * Math.PI * 2);
+      uctx.lineWidth = 5; uctx.strokeStyle = "#ffd60a"; uctx.stroke();
+    }
+    uctx.restore();
+  }
+}
+function menuHit(p) {
+  if (!p) return null;
+  return menuItems().find(it => Math.hypot(p.x - it.x, p.y - it.y) < it.r + 10) || null;
+}
+
+// ---------- Zeichnen ----------
+function brushColor() {
+  if (state.brush === "rainbow") { state.hue = (state.hue + 4) % 360; return `hsl(${state.hue},100%,60%)`; }
+  return state.color;
+}
+function symmetricSegments(a, b) {
+  if (!state.kaleido) return [[a, b]];
+  const cx = draw.width / 2, cy = draw.height / 2, out = [], N = 6;
+  for (let i = 0; i < N; i++) {
+    const ang = (i * 2 * Math.PI) / N;
+    for (const m of [1, -1]) {
+      const t = (p) => { const dx = p.x - cx, dy = (p.y - cy) * m; return { x: cx + dx * Math.cos(ang) - dy * Math.sin(ang), y: cy + dx * Math.sin(ang) + dy * Math.cos(ang) }; };
+      out.push([t(a), t(b)]);
+    }
+  }
+  return out;
+}
+function stroke(a, b, erase) {
+  const col = brushColor(), w = erase ? state.size * 5 : state.size;
+  for (const [p, q] of symmetricSegments(a, b)) {
+    dctx.save();
+    dctx.lineCap = dctx.lineJoin = "round";
+    if (erase) {
+      dctx.globalCompositeOperation = "destination-out";
+      dctx.lineWidth = w; dctx.beginPath(); dctx.moveTo(p.x, p.y); dctx.lineTo(q.x, q.y); dctx.stroke();
+    } else if (state.brush === "spray") {
+      dctx.fillStyle = col;
+      const steps = Math.max(1, Math.hypot(q.x - p.x, q.y - p.y) / 3);
+      for (let s = 0; s < steps; s++) {
+        const bx = p.x + (q.x - p.x) * s / steps, by = p.y + (q.y - p.y) * s / steps;
+        for (let k = 0; k < 8; k++) { const r = Math.random() * w * 1.6, a2 = Math.random() * 6.28; dctx.fillRect(bx + Math.cos(a2) * r, by + Math.sin(a2) * r, 1.8, 1.8); }
+      }
+    } else {
+      if (state.brush !== "normal") { dctx.shadowBlur = state.brush === "sparkle" ? 12 : 22; dctx.shadowColor = col; }
+      dctx.strokeStyle = col; dctx.lineWidth = state.brush === "sparkle" ? w * 0.5 : w;
+      dctx.beginPath(); dctx.moveTo(p.x, p.y); dctx.lineTo(q.x, q.y); dctx.stroke();
+      if (state.brush === "neon" || state.brush === "rainbow") { // heller Kern
+        dctx.shadowBlur = 0; dctx.strokeStyle = "rgba(255,255,255,.8)"; dctx.lineWidth = Math.max(1.5, w * 0.3); dctx.stroke();
+      }
+      if (state.brush === "sparkle") burst(q.x, q.y, col, 3);
+    }
+    dctx.restore();
+  }
+}
+function pushUndo() {
+  try { undoStack.push(dctx.getImageData(0, 0, draw.width, draw.height)); if (undoStack.length > 25) undoStack.shift(); } catch {}
+}
+function undo() {
+  const img = undoStack.pop();
+  if (img) { dctx.putImageData(img, 0, 0); toast("Rückgängig ↶"); } else toast("Nichts zum Rückgängigmachen");
+}
+function clearAll(fancy) {
+  pushUndo();
+  if (fancy) for (let i = 0; i < 120; i++) burst(Math.random() * draw.width, Math.random() * draw.height, COLORS[i % 5], 1);
+  dctx.clearRect(0, 0, draw.width, draw.height);
+  toast("Alles gelöscht 💥");
+}
+
+// ---------- Partikel ----------
+function burst(x, y, color, n) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2, s = 1 + Math.random() * 4;
+    particles.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s - 1, life: 1, color, size: 1.5 + Math.random() * 3 });
+  }
+}
+function updateParticles() {
+  fctx.clearRect(0, 0, fx.width, fx.height);
+  fctx.globalCompositeOperation = "lighter";
+  particles = particles.filter(p => (p.life -= 0.025) > 0);
+  for (const p of particles) {
+    p.x += p.vx; p.y += p.vy; p.vy += 0.08;
+    fctx.globalAlpha = p.life; fctx.fillStyle = p.color;
+    fctx.beginPath(); fctx.arc(p.x, p.y, p.size * p.life + 0.5, 0, 6.28); fctx.fill();
+  }
+  fctx.globalAlpha = 1; fctx.globalCompositeOperation = "source-over";
+}
+
+// ---------- Kamera & Hand-Erkennung ----------
+$("start").onclick = async (e) => {
+  const btn = e.currentTarget;
+  btn.textContent = "Lade Hand-Erkennung…"; btn.disabled = true;
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 960 } });
+    video.srcObject = stream;
+    await new Promise(r => video.onloadedmetadata = r);
+    for (const c of [draw, fx, ui]) { c.width = video.videoWidth; c.height = video.videoHeight; }
+    const files = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+    landmarker = await HandLandmarker.createFromOptions(files, {
+      baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task", delegate: "GPU" },
+      runningMode: "VIDEO", numHands: 1,
+    });
+    btn.remove();
+    toast("Los geht's! ☝️ Zeigefinger hoch zum Zeichnen");
+    requestAnimationFrame(loop);
+  } catch (err) {
+    btn.disabled = false;
+    btn.textContent = "Fehler: " + (err.name === "NotAllowedError" ? "Kamera nicht erlaubt" : err.message);
+  }
+};
+
+const up = (lm, tip, pip) => lm[tip].y < lm[pip].y;
+const CONN = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],[9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+
+function loop(now) {
+  updateParticles();
+  if (video.currentTime !== lastTime) {
+    lastTime = video.currentTime;
+    frames++; if (now - fpsT > 1000) { fps = frames; frames = 0; fpsT = now; }
+    const res = landmarker.detectForVideo(video, now);
+    const W = ui.width, H = ui.height;
+    uctx.clearRect(0, 0, W, H);
+    let mode = "Keine Hand", finger = null;
+
+    if (res.landmarks?.length) {
+      const lm = res.landmarks[0].map(p => ({ x: (1 - p.x) * W, y: p.y * H })); // gespiegelt
+      const raw = res.landmarks[0];
+      // Skelett
+      uctx.strokeStyle = "rgba(255,255,255,.35)"; uctx.lineWidth = 2;
+      for (const [a, b] of CONN) { uctx.beginPath(); uctx.moveTo(lm[a].x, lm[a].y); uctx.lineTo(lm[b].x, lm[b].y); uctx.stroke(); }
+
+      const i = up(raw, 8, 6), m = up(raw, 12, 10), r = up(raw, 16, 14), p = up(raw, 20, 18);
+      const target = lm[8];
+      smooth = smooth ? { x: .55 * target.x + .45 * smooth.x, y: .55 * target.y + .45 * smooth.y } : { ...target };
+      finger = smooth;
+
+      const fist = !i && !m && !r && !p;
+      const palm = i && m && r && p;
+      const drawing = i && !m && !r && !p;
+      const inMenu = !!menuHit(smooth) || smooth.y < 110;
+
+      // Faust halten -> löschen
+      if (fist) {
+        if (!fistStart) fistStart = now;
+        const prog = Math.min(1, (now - fistStart) / 1200);
+        uctx.beginPath(); uctx.arc(lm[9].x, lm[9].y, 50, -Math.PI / 2, -Math.PI / 2 + prog * 6.283);
+        uctx.lineWidth = 8; uctx.strokeStyle = "#ff3b5c"; uctx.stroke();
+        mode = "✊ Halten zum Löschen…";
+        if (prog >= 1) { clearAll(true); fistStart = now + 99999; }
+      } else fistStart = 0;
+
+      if (palm) {
+        mode = "🖐️ Radieren";
+        const c = lm[9];
+        if (!strokeActive) { pushUndo(); strokeActive = true; }
+        if (prev) stroke(prev, c, true);
+        prev = { ...c };
+        uctx.beginPath(); uctx.arc(c.x, c.y, state.size * 2.5, 0, 6.283); uctx.lineWidth = 2; uctx.strokeStyle = "#fff"; uctx.stroke();
+      } else if (drawing && !inMenu) {
+        mode = (state.kaleido ? "❄️ " : "") + "Zeichnen · " + BRUSHES.find(b => b.id === state.brush).name;
+        if (!strokeActive) { pushUndo(); strokeActive = true; }
+        if (prev) stroke(prev, smooth, false);
+        prev = { ...smooth };
+        uctx.fillStyle = state.brush === "rainbow" ? `hsl(${state.hue},100%,60%)` : state.color;
+        uctx.shadowBlur = 20; uctx.shadowColor = uctx.fillStyle;
+        uctx.beginPath(); uctx.arc(smooth.x, smooth.y, state.size / 2 + 3, 0, 6.283); uctx.fill();
+        uctx.shadowBlur = 0;
+      } else {
+        if (!fist) mode = inMenu ? "Auswählen…" : "✌️ Stift oben";
+        prev = null; strokeActive = false;
+        uctx.beginPath(); uctx.arc(smooth.x, smooth.y, 12, 0, 6.283); uctx.lineWidth = 3; uctx.strokeStyle = "#fff"; uctx.stroke();
+      }
+
+      // Hover-Auswahl im Luft-Menü
+      const hit = menuHit(smooth);
+      if (hit) {
+        if (hover.key !== hit.key) hover = { key: hit.key, t: now };
+        else if (now - hover.t > 600) { choose(hit.key); hover = { key: hit.key, t: now + 1e9 }; }
+      } else hover = { key: null, t: 0 };
+    } else { prev = null; smooth = null; strokeActive = false; hover = { key: null, t: 0 }; fistStart = 0; }
+
+    drawMenu(finger, now);
+    $("status").textContent = `${mode} · ${fps} FPS`;
+  }
+  requestAnimationFrame(loop);
+}
+
+// ---------- Leiste & Tasten ----------
+let toastTimer;
+function toast(msg) { const t = $("toast"); t.textContent = msg; t.classList.add("show"); clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove("show"), 1400); }
+function toggleBoard() { state.board = !state.board; video.classList.toggle("dim", state.board); $("bgBtn").classList.toggle("on", state.board); }
+function save() {
+  const out = document.createElement("canvas"); out.width = draw.width; out.height = draw.height;
+  const c = out.getContext("2d");
+  if (state.board || !video.videoWidth) { c.fillStyle = "#000"; c.fillRect(0, 0, out.width, out.height); }
+  else { c.save(); c.translate(out.width, 0); c.scale(-1, 1); c.drawImage(video, 0, 0, out.width, out.height); c.restore(); }
+  c.drawImage(draw, 0, 0);
+  const a = document.createElement("a"); a.href = out.toDataURL("image/png"); a.download = "luft-zeichnung.png"; a.click();
+  toast("Gespeichert 📸");
+}
+$("undo").onclick = undo;
+$("clear").onclick = () => clearAll(true);
+$("bgBtn").onclick = toggleBoard;
+$("save").onclick = save;
+$("size").oninput = (e) => state.size = +e.target.value;
+document.addEventListener("keydown", (e) => {
+  if (e.target.tagName === "INPUT") return;
+  const k = e.key.toLowerCase();
+  if (k >= "1" && k <= "5") choose("c" + (+k - 1));
+  const bi = "qwert".indexOf(k); if (bi >= 0) choose("b" + BRUSHES[bi].id);
+  if (k === "k") choose("kaleido");
+  if (k === "z") undo();
+  if (k === "c") clearAll(true);
+  if (k === "b") toggleBoard();
+  if (k === "s") save();
+});
+</script>
+</body>
+</html>
